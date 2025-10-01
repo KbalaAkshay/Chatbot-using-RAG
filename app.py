@@ -15,114 +15,87 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 st.set_page_config(page_title="ChatBot")
 
-# Initialize session state for chat
+# --- Session state ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-st.title("Chatbot")
+if "file_uploaded" not in st.session_state:
+    st.session_state.file_uploaded = False
 
-# File uploader (PDF or TXT)
-uploaded_file = st.file_uploader("Upload a file", type=["pdf", "txt"])
+# --- File upload ---
+uploaded_file = st.file_uploader("Upload PDF or TXT", type=["pdf", "txt"])
 
-
-if uploaded_file is None:
-    st.warning("⚠️ Please upload a file to continue.")
-    st.stop()   # ✅ stops execution until a file is uploaded
-
-
-file_name=uploaded_file.name
-# Extract text from file
-file_text = ""
-if uploaded_file is not None:
+if uploaded_file and not st.session_state.file_uploaded:
+    file_name = uploaded_file.name
+    file_text = ""
+    
     if uploaded_file.type == "application/pdf":
         pdf_reader = PyPDF2.PdfReader(uploaded_file)
-        for page in pdf_reader.pages:
-            file_text += page.extract_text()
-    elif uploaded_file.type == "text/plain":
+        file_text = "\n".join(page.extract_text() for page in pdf_reader.pages)
+    else:
         file_text = uploaded_file.read().decode("utf-8")
-
+    
+    st.session_state.file_text = file_text
+    st.session_state.file_name = file_name
+    st.session_state.file_uploaded = True
     st.success("✅ File uploaded successfully!")
 
-print(file_text)
-
+# --- Pinecone setup ---
 load_dotenv()
+pc = Pinecone(os.environ.get("PINECONE_API_KEY"))
+index_name = os.environ.get("Index_name")
 
-# -------------------- Pinecone setup --------------------
-pine_key = os.environ.get("PINECONE_API_KEY")
-pc = Pinecone(pine_key)
-
-index_name =os.environ.get("Index_name")
-
-# If index exists, delete it to avoid dimension mismatch
-if pc.has_index(index_name):
-    print(f"Deleting existing index '{index_name}'...")
-    pc.delete_index(index_name)
-    time.sleep(5)  # wait for deletion
-
-# Create a new index for MiniLM embeddings (dimension 384)
-if not pc.has_index(index_name):
-    print(f"Creating index '{index_name}'...")
-    pc.create_index(
-        name=index_name,
-        dimension=384,
-        metric="cosine",
-        spec=ServerlessSpec(cloud="aws", region="us-east-1")
-    )
-
-
-# Wait until index is ready
-while not pc.describe_index(index_name).status["ready"]:
-    print("Waiting for index to be ready...")
-    time.sleep(1)
+if "index_created" not in st.session_state:
+    if not pc.has_index(index_name):
+        pc.create_index(
+            name=index_name,
+            dimension=384,
+            metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region="us-east-1")
+        )
+    st.session_state.index_created = True
 
 index = pc.Index(index_name)
-
-# -------------------- Embeddings --------------------
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 vector_store = PineconeVectorStore(index=index, embedding=embeddings)
 
+# --- Ingest file once ---
+if st.session_state.file_uploaded and "chunks_added" not in st.session_state:
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    chunks = text_splitter.split_text(st.session_state.file_text)
+    chunk_documents = [
+        Document(page_content=chunk, metadata={"source": st.session_state.file_name, "chunk_id": str(i+1)})
+        for i, chunk in enumerate(chunks)
+    ]
+    chunk_ids = [str(uuid.uuid4()) for _ in chunk_documents]
+    vector_store.add_documents(documents=chunk_documents, ids=chunk_ids)
+    st.session_state.chunks_added = True
+    st.success(f"✅ Added {len(chunk_documents)} chunks to Pinecone index!")
 
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=500,
-    chunk_overlap=50
-)
-chunks = text_splitter.split_text(file_text)
+# --- Retriever (once) ---
+if "retriever" not in st.session_state:
+    st.session_state.retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 1})
 
-# Wrap each chunk as a Document with metadata
-chunk_documents = [
-    Document(page_content=chunk, metadata={"source": file_name, "chunk_id": str(i+1)})
-    for i, chunk in enumerate(chunks)
-]
+retriever = st.session_state.retriever
 
-# Generate unique ids for each chunk
-chunk_ids = [str(uuid.uuid4()) for _ in chunk_documents]
-
-# -------------------- Upload to Pinecone --------------------
-vector_store.add_documents(documents=chunk_documents, ids=chunk_ids)
-
-print(f"Successfully added {len(chunk_documents)} chunks from '{file_name}' to Pinecone index '{index_name}'!")
-# Chat UI
+# --- Chat UI ---
 st.subheader("💬 Chat")
-
-user_input = st.text_input("You:", "")
-
-print(user_input)
-
+user_input = st.text_input("You:")
 
 if st.button("Send") and user_input:
-    # Save user message
     st.session_state.messages.append({"role": "user", "content": user_input})
-
-    # Simple dummy response (replace with RAG later)
-    if file_text:
-        response = f"I read your file. You asked: '{user_input}'.\n(Sample answer — integrate LLM later)"
-    else:
-        response = "Please upload a file first."
-
-    # Save assistant message
+    
+    # Retrieval
+    results = retriever.get_relevant_documents(user_input)
+    retrieved_text = "\n".join(
+        f"- {res.page_content} [source: {res.metadata.get('source')}, chunk: {res.metadata.get('chunk_id')}]"
+        for res in results
+    )
+    
+    response = f"I found the following relevant parts from your file:\n{retrieved_text}"
     st.session_state.messages.append({"role": "assistant", "content": response})
 
-# Display chat messages
+# --- Display chat messages ---
 for msg in st.session_state.messages:
     if msg["role"] == "user":
         st.chat_message("user").write(msg["content"])
