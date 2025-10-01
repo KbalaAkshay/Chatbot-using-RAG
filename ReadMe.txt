@@ -54,3 +54,8 @@ This project is a **Streamlit-based chatbot** that allows users to upload PDF or
 ```bash
 git clone <your-repo-url>
 cd <your-repo-folder>
+
+Challanges:
+Need to use a fine tune LLM so the output will be precise 
+Here due to token limit we are unable to achieve it 
+But the process remains same
